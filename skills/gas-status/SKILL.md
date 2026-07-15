@@ -1,10 +1,12 @@
 ---
 type: Skill
+mode: read-only
 name: ETH Gas Status
 category: crypto
 description: Queries Etherscan gas oracle and prints current Safe / Standard / Fast gwei with traffic-light status; flags when gas drops below the configured low-threshold
 var: "20"
 tags: [crypto, ethereum, gas, sparkleware]
+requires: [ETHERSCAN_API_KEY?]
 ---
 
 > **${var}** — the low-gas threshold in gwei that trips the 🟢 cheap-window flag. Defaults to `20` when empty. Lower it (e.g. 8–10) to only get signal on genuinely cheap moments; raise it if your on-chain ops tolerate higher fees.
@@ -32,10 +34,7 @@ When gas is high, print `🔴` and skip the alert. When it's between threshold a
 ```bash
 THRESHOLD="${var:-20}"
 # Etherscan gas oracle — works without an API key for low-volume read traffic.
-# Optional: export ETHERSCAN_API_KEY for higher rate limits.
-API_KEY="${ETHERSCAN_API_KEY:-}"
 URL="https://api.etherscan.io/api?module=gastracker&action=gasoracle"
-if [ -n "$API_KEY" ]; then URL="${URL}&apikey=${API_KEY}"; fi
 
 OUT_FILE="output/gas-status-${today}.md"
 mkdir -p output
@@ -44,18 +43,22 @@ RUN_STATUS="STATUS_OK"
 
 ### 2. Fetch + parse
 
-This is a JSON API read. Try `curl` first; if it comes back empty inside the GitHub Actions sandbox (network gate), retry the **same `$URL`** with the built-in **WebFetch** tool and use the JSON it returns as `$RESP`. See the [Sandbox note](#sandbox-note) below.
+A JSON API read — keyless by default, so plain `curl` is the primary path. When `ETHERSCAN_API_KEY` is set (higher rate limits), route the call through `./secretcurl` with an `{ENV_NAME}` placeholder so the key never appears on a command line. See the [Network note](#network-note) below.
 
 ```bash
-RESP="$(curl -fsSL -H 'User-Agent: sparkleware-eth-gas-watch/0.1' "$URL" 2>/dev/null || echo '')"
+if [ -n "${ETHERSCAN_API_KEY:-}" ]; then
+  RESP="$(./secretcurl "${URL}&apikey={ETHERSCAN_API_KEY}" 2>/dev/null || echo '')"
+else
+  RESP="$(curl -fsSL -H 'User-Agent: sparkleware-eth-gas-watch/0.1' "$URL" 2>/dev/null || echo '')"
+fi
 ```
 
-If `$RESP` is empty or its `.status` is not `1`, fall back: call **WebFetch** on the same `$URL`, extract the JSON body from the response, and continue with that as `$RESP`. Whenever the fallback is used (or data is still unavailable after it), set `RUN_STATUS="STATUS_DEGRADED"`.
+If `$RESP` is empty or its `.status` is not `1` (flaky GET or rate limit), fall back: call **WebFetch** on the same keyless `$URL`, extract the JSON body from the response, and continue with that as `$RESP`. Whenever the fallback is used (or data is still unavailable after it), set `RUN_STATUS="STATUS_DEGRADED"`.
 
 ```bash
 STATUS="$(echo "$RESP" | jq -r '.status // "0"')"
 if [ "$STATUS" != "1" ]; then
-  # curl was blocked or rate-limited — retry the SAME URL with WebFetch (see Sandbox note),
+  # flaky GET or rate limit — retry the SAME keyless URL with WebFetch (see Network note),
   # assign its JSON body to RESP, then re-parse. Mark the run degraded.
   RUN_STATUS="STATUS_DEGRADED"
   STATUS="$(echo "$RESP" | jq -r '.status // "0"')"
@@ -94,6 +97,26 @@ fi
 
 NOW="$(date -u +%Y-%m-%dT%H:%MZ)"
 ONE_LINER="Safe ${SAFE}  ·  Std ${STD}  ·  Fast ${FAST}  gwei   →   ${EMOJI} ${LABEL}"
+```
+
+### 3.5 Trend vs the last reading (from this skill's own ledger)
+
+The historical ledger written in Step 7 doubles as a trend source — compare against the previous run so the digest says *where gas is heading*, not just where it is:
+
+```bash
+LEDGER="${AEON_ROOT:-.}/memory/logs/gas-watch.log"
+TREND=""
+if [ -f "$LEDGER" ] && [ "$STD" != "?" ]; then
+  PREV_STD="$(tail -1 "$LEDGER" | sed -n 's/.* std=\([0-9.]*\) .*/\1/p')"
+  if [ -n "$PREV_STD" ]; then
+    DELTA=$(( $(printf '%.0f' "$STD") - $(printf '%.0f' "$PREV_STD") ))
+    if   [ "$DELTA" -gt 0 ]; then TREND="↑ +${DELTA} gwei since last check"
+    elif [ "$DELTA" -lt 0 ]; then TREND="↓ ${DELTA} gwei since last check"
+    else                          TREND="→ flat since last check"
+    fi
+    ONE_LINER="${ONE_LINER}   (${TREND})"
+  fi
+fi
 ```
 
 ### 4. Write the digest to `output/`
@@ -167,14 +190,15 @@ if [ -d "${AEON_ROOT:-.}/memory" ]; then
 fi
 ```
 
-## Sandbox note
+## Network note
 
-`WebFetch` and `WebSearch` are built-in Claude tools that bypass the GitHub Actions sandbox network gate. Use those for external reads; if a `curl` call returns empty in the sandbox, retry the same URL with `WebFetch`. This skill reads a JSON API, so `curl` stays the primary fetch in Step 2 — but when it returns empty (or a non-`1` status), re-fetch the identical `$URL` with `WebFetch`, take the JSON from its response, and continue parsing as normal.
+There is no network sandbox — `curl` works normally. The keyless Etherscan GET is the primary path. When `ETHERSCAN_API_KEY` is set, the call goes through `./secretcurl` with an `{ETHERSCAN_API_KEY}` placeholder — never interpolate the key into a plain `curl` command line. If a GET returns empty or a non-`1` status (flaky or rate-limited), re-fetch the identical keyless `$URL` with the built-in **WebFetch** tool, take the JSON from its response, and continue parsing as normal.
 
 ## Notes
 
-- Etherscan's gas oracle endpoint works without an API key for casual use. For production / higher cadence, register a free key at https://etherscan.io/apis and export `ETHERSCAN_API_KEY` before running Aeon.
+- Etherscan's gas oracle endpoint works without an API key for casual use. For production / higher cadence, register a free key at https://etherscan.io/apis and set `ETHERSCAN_API_KEY` as a repo secret.
 - Default schedule is every 4 hours — catches typical low-gas windows (often early UTC mornings on weekends).
 - `${var}` is your gwei threshold for the 🟢 alert. Default 20. Set lower (e.g. 8-10) if you only want signal on genuinely cheap moments.
+- The Step-7 ledger accumulates a grep-able gas-price history; Step 3.5 reads it back for the trend line, so the skill's signal compounds the longer it runs.
 - All read, no writes to chain — safe to schedule indefinitely.
-- Requires `curl` and `jq`; `WebFetch` covers the sandbox fallback.
+- Requires `curl` and `jq`; `WebFetch` covers flaky public GETs.

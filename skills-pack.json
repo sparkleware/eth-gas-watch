@@ -9,10 +9,13 @@
     {
       "slug": "gas-status",
       "path": "skills/gas-status",
-      "description": "Queries Etherscan gas oracle and prints current Safe / Standard / Fast gwei with traffic-light status.",
+      "description": "Queries Etherscan gas oracle and prints current Safe / Standard / Fast gwei with traffic-light status and a trend line from its own ledger.",
       "category": "crypto",
       "schedule": "0 */4 * * *",
-      "default_enabled": true
+      "default_enabled": true,
+      "capabilities": ["read_only", "external_api", "sends_notifications"],
+      "secrets_required": [],
+      "secrets_optional": ["ETHERSCAN_API_KEY"]
     }
   ]
 }
